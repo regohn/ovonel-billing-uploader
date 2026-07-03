@@ -4,3 +4,4 @@ pdfplumber
 google-genai
 pydantic
 pydantic-core
+python-multipart
