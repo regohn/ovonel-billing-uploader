@@ -66,24 +66,56 @@ financial summaries from raw document text or images and return them as a clean 
 object.
 
 CRITICAL OPERATIONAL RULES:
+
 1. DATA TYPES: Transform all financial numbers into pure float values.
    Strip currency symbols (₱, P, PHP, $), whitespace, footnotes, and
    formatting commas — e.g. "₱ 11,200.00" becomes 11200.00.
+
 2. EXTRACTION TRUTH: Extract only data explicitly present in the document.
    Do not hallucinate or compute missing values unless applying DATA REPAIR below.
+
 3. DATA REPAIR: If a financial sub-section has minor OCR issues (e.g. "10,00.00"
    under VATable Sales), apply standard Philippine VAT accounting logic to infer the
    true value using surrounding totals (VATable + 12% VAT = Total).
-4. TAX DETAILS: Clearly differentiate Vendor details from Customer details using
-   contextual headers such as "SOLD TO", "BILL TO", or "Registered Name".
-   TINs must retain their hyphens (e.g. 123-456-789-000).
-5. MISSING FIELDS: If a field cannot be found or inferred, return null for that key.
+
+4. VENDOR vs CUSTOMER IDENTIFICATION (most critical rule):
+   - The VENDOR (issuer/seller) is the company whose name and logo appears at the
+     TOP of the invoice — typically in large bold text in the header. They are the
+     one ISSUING the invoice. Their TIN appears near the top under their name,
+     labelled "VAT Reg. TIN" or "TIN:". Extract this as vendor_name and vendor_tin.
+   - The CUSTOMER (buyer/billed party) is found under the "SOLD TO" or "BILL TO"
+     section. Their name appears next to "Registered Name:" and their TIN appears
+     next to "TIN:". Extract this as customer_name and customer_tin.
+   - NEVER use the cashier, signatory, representative, or "By:" field as the
+     customer name. Names appearing under "Cashier", "Authorized Representative",
+     "Prepared by", or "By:" are signatories only — ignore them for customer_name.
+
+5. INVOICE NUMBER: Found near the top right of the invoice, labelled "No.", "Invoice
+   No.", or "N°". It is usually a short numeric code (e.g. "0508"). Do NOT confuse
+   it with BIR ATP numbers, booking references, or container numbers.
+
+6. BIR ATP NUMBER: Found at the bottom left of the invoice, labelled "BIR Authority
+   to Print No." or "BIR Auth. to Print No." — it is a long alphanumeric code
+   starting with digits and letters (e.g. "052AU20260000001427"). Extract the full
+   number exactly as printed.
+
+7. TIN FORMAT: TINs must retain their hyphens (e.g. 123-456-789-000).
+
+8. MISSING FIELDS: If a field cannot be found or inferred, return null for that key.
    Never omit a key from the response object.
-6. OUTPUT FORMAT: Return ONLY a raw JSON object. No markdown fences, no explanation,
+
+9. OUTPUT FORMAT: Return ONLY a raw JSON object. No markdown fences, no explanation,
    no preamble. The response must be directly parseable by json.loads()."""
 
 TEXT_PROMPT_TEMPLATE = """Analyse the following raw text extracted from a Philippine
 service billing invoice. Extract and populate every field in the JSON schema below.
+
+REMINDERS:
+- vendor_name = company at the TOP of the invoice (the issuer/seller)
+- customer_name = name under "SOLD TO" / "Registered Name" section
+- Do NOT use cashier or signatory names as customer_name
+- invoice_number = the short "No." or "N°" number near the top right
+- bir_atp_no = the long BIR Authority to Print number at the bottom
 
 [START OF RAW INVOICE TEXT]
 {raw_text}
@@ -104,6 +136,13 @@ Return ONLY this JSON object with values filled in (use null for missing fields)
 
 VISION_PROMPT = """Analyse this Philippine service billing invoice image or scanned
 document. Extract and populate every field in the JSON schema below.
+
+CRITICAL REMINDERS:
+- vendor_name = the company name printed largest at the TOP of the invoice (the issuer)
+- customer_name = the name under the "SOLD TO" box next to "Registered Name:"
+- Do NOT use the cashier, "By:", or "Authorized Representative" name as customer_name
+- invoice_number = the short number after "No." or "N°" near the top right corner
+- bir_atp_no = the long alphanumeric code after "BIR Authority to Print No." at the bottom left
 
 Return ONLY this JSON object with values filled in (use null for missing fields):
 {
@@ -229,31 +268,18 @@ def extract(req: ExtractRequest):
 
     raw_dict: dict | None = None
 
-    # ── Route A: PDF with native text layer ──────────────────────────────────
+    # ── Route A: PDF → always vision for layout-aware extraction ────────────
     if req.mime_type == "application/pdf":
-        pdf_text = extract_pdf_text(raw_bytes)
-
-        if pdf_text and len(pdf_text) > 80:
-            log.info("PDF text layer found (%d chars) — using text route.", len(pdf_text))
-            try:
-                raw_dict = call_gemini_text(pdf_text)
-                log.info("Gemini text route succeeded.")
-            except Exception as exc:
-                log.warning("Gemini text route failed: %s — falling back to vision.", exc)
-                raw_dict = None
-
-        # ── Route B: Scanned PDF fallback → vision ────────────────────────
-        if raw_dict is None:
-            log.info("Scanned/empty PDF — using multimodal vision route.")
-            try:
-                raw_dict = call_gemini_vision(raw_bytes, "application/pdf")
-                log.info("Gemini vision route (PDF) succeeded.")
-            except Exception as exc:
-                log.error("Gemini vision route failed: %s", exc)
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"AI extraction failed for scanned PDF: {exc}"
-                )
+        log.info("PDF received — using multimodal vision for layout accuracy.")
+        try:
+            raw_dict = call_gemini_vision(raw_bytes, "application/pdf")
+            log.info("Gemini vision route (PDF) succeeded.")
+        except Exception as exc:
+            log.error("Gemini vision route failed: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI extraction failed for PDF: {exc}"
+            )
 
     # ── Route C: Image upload → vision ───────────────────────────────────────
     elif req.mime_type.startswith("image/"):
